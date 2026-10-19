@@ -131,6 +131,34 @@ window.__ModuleLoader__.load({
       } catch { /* revealing the application must never throw */ }
     }
 
+    /**
+     * Page-global marker: this page has already played its splash.
+     *
+     * It is set the moment the splash starts leaving the screen, so a module reload
+     * that happens afterwards (client HMR, plugin re-activation) does not replay the
+     * opening animation over the interface the user is already using. The marker
+     * lives on the page global because a module reload recreates this module's state;
+     * only an actual page load clears it.
+     */
+    const PLAYED_KEY = '__DSH_SPLASH_PLAYED__'
+
+    /** @returns whether this page has already played the splash. */
+    function splashPlayed() {
+      try {
+        return globalThis[PLAYED_KEY] === true
+      } catch {
+        // A frozen globalThis keeps the pre-existing per-module behavior.
+        return false
+      }
+    }
+
+    /** Record that this page has played the splash. */
+    function markSplashPlayed() {
+      try {
+        globalThis[PLAYED_KEY] = true
+      } catch { /* a frozen globalThis is not worth failing a boot over */ }
+    }
+
     const BASE = '/dsh-splash-animation'
     const CONFIG_URL = `${BASE}/config.json`
     /**
@@ -501,7 +529,38 @@ window.__ModuleLoader__.load({
       const dismiss = React.useCallback(() => {
         if (dismissedRef.current) return
         dismissedRef.current = true
+        // The page has shown its splash now; a later module reload must not replay
+        // it over the interface the user is already using. See `PLAYED_KEY`.
+        markSplashPlayed()
         setPhase('out')
+      }, [])
+
+      /**
+       * Release the video's decoder and compositor surface before the element
+       * leaves the document.
+       *
+       * Removing a full-screen `<video>` straight out of playback makes Chromium
+       * tear the media player down after the removal. With a hardware video
+       * overlay (DirectComposition on Windows) the overlay plane can outlive the
+       * element and reappear over the page as a full-screen flicker of the last
+       * frame while the interface sits idle; refreshing the page is the only way
+       * out, because nothing in the document owns the leftover plane. Pausing and
+       * clearing the source first hands the teardown to the media element while
+       * it is still attached, and the frames the fade effect waits for below let
+       * the compositor drop the overlay before the overlay node is unmounted.
+       */
+      const releaseMedia = React.useCallback(() => {
+        const element = videoRef.current
+        if (element === null || element === undefined) return
+        try {
+          element.pause()
+        } catch { /* an already torn-down element is released already */ }
+        try {
+          // Clearing the source destroys the media resource (and with it the
+          // overlay plane) instead of leaving it to the element's removal.
+          element.removeAttribute('src')
+          element.load()
+        } catch { /* same */ }
       }, [])
 
       /**
@@ -689,6 +748,11 @@ window.__ModuleLoader__.load({
             element.removeEventListener('error', onError)
             element.removeEventListener('loadeddata', onPaintable)
             element.removeEventListener('canplay', onPaintable)
+            // A disposal that skips the fade (HMR, plugin disable) must not leave
+            // the media playing behind a node the document no longer shows.
+            try {
+              element.pause()
+            } catch { /* already torn down */ }
           }
         }
 
@@ -722,9 +786,31 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (phase !== 'out') return undefined
         const fade = num(session.settings && session.settings.fadeOutMs, FALLBACK.fadeOutMs)
-        const id = window.setTimeout(() => setSession({ phase: 'done' }), fade)
-        return () => window.clearTimeout(id)
-      }, [phase, session.settings])
+        let done = false
+        let frame = 0
+        let guard = 0
+        const finish = () => {
+          if (done) return
+          done = true
+          setSession({ phase: 'done' })
+        }
+        const id = window.setTimeout(() => {
+          releaseMedia()
+          // Two frames: the first is composited with the media resource already
+          // gone, the second unmounts after that frame reached the screen. A
+          // hidden tab runs no rAF at all, so the guard keeps the dismissal on
+          // time instead of leaving a transparent overlay capturing input.
+          frame = window.requestAnimationFrame(() => {
+            frame = window.requestAnimationFrame(finish)
+          })
+          guard = window.setTimeout(finish, 1000)
+        }, fade)
+        return () => {
+          window.clearTimeout(id)
+          window.clearTimeout(guard)
+          if (frame !== 0) window.cancelAnimationFrame(frame)
+        }
+      }, [phase, session.settings, releaseMedia])
 
       if (session.phase === 'done') return null
 
@@ -782,6 +868,13 @@ window.__ModuleLoader__.load({
             height: '100%',
             objectFit: objectFit(settings.fit),
             background: settings.background,
+            // Keep the frame out of Chromium's DirectComposition hardware
+            // video-overlay path. An opacity just below 1 makes the quad require
+            // blending, which that path rejects; the blend is 0.1% of the frame
+            // over this overlay's own background, i.e. invisible. The overlay
+            // plane is the layer that can outlive a removed element on Windows
+            // and flicker over the page while the interface sits idle.
+            opacity: 0.999,
           },
         }))
       } else {
@@ -1347,10 +1440,15 @@ window.__ModuleLoader__.load({
         //
         // With no video this plugin adds nothing to the frame and DSH boots exactly
         // as it would without the plugin installed.
+        //
+        // The page-global marker, set when the splash dismisses, keeps a later module
+        // reload (client HMR, plugin re-activation) from replaying the opening
+        // animation over an interface the user is already using. Only a real page
+        // load shows the splash again.
         const initial = payloadSync()
         const initialMedia = (initial && initial.media) || { kind: 'none' }
         const initialProblem = (initial && initial.problem) || null
-        if (initialMedia.kind !== 'none' && initialProblem === null) {
+        if (initialMedia.kind !== 'none' && initialProblem === null && !splashPlayed()) {
           ctx.slots.inject(OVERLAY_SLOT, () => ctx.slots.register(
             { name: OVERLAY_SLOT, id: ROW_ID, order: 900 },
             SplashAnimation,
@@ -1361,7 +1459,8 @@ window.__ModuleLoader__.load({
           // normally agrees with the read above — but the two halves read the same
           // file at different moments, and a disagreement here would leave the
           // application hidden with no splash to replace it. Releasing is idempotent
-          // and harmless when no cover was injected at all.
+          // and harmless when no cover was injected at all. This also runs on a
+          // re-activation that skips the replay.
           releaseCover()
         }
       },
